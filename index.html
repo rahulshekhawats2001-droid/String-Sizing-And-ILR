@@ -1,3 +1,4 @@
+
 <!doctype html>
 <html lang="en">
 <head>
@@ -3317,7 +3318,7 @@ label,.card .k,.card .u,.small,.disclaimer,
         <h2>Step 19 — Payback, NPV, IRR</h2>
         <div class="cards" id="paybackCards" style="grid-template-columns:repeat(4,1fr)"></div>
         <p class="small" style="margin:12px 0 8px"><b>Preliminary financial estimate.</b></p>
-        <div class="tablewrap"><table class="wftable" id="cashflowTable"><thead><tr><th>Year</th><th>Generation (MWh)</th><th>Revenue (₹ lakh)</th><th>OPEX (₹ lakh)</th><th>Net cash flow (₹ lakh)</th><th>Cumulative (₹ lakh)</th></tr></thead><tbody></tbody></table></div>
+        <div class="tablewrap"><table class="wftable" id="cashflowTable"><thead><tr><th>Year</th><th>Generation (MWh)</th><th>Revenue (₹ lakh)</th><th>OPEX (₹ lakh)</th><th>Net cash flow (₹ lakh)</th><th>Cumulative incl. CAPEX (₹ lakh)</th><th>Discounted cumulative incl. CAPEX (₹ lakh)</th></tr></thead><tbody></tbody></table></div>
       </div>
 
       <div class="panel">
@@ -4692,7 +4693,7 @@ function chooseSymmetricStringCount(targetDCW,moduleWp,modulesPerString,inverter
     const actualDCW=strings*moduleWp*modulesPerString;
     const ratio=actualDCW/targetDCW;
     return {strings,actualDCW,ratio};
-  }).filter(r=>r.ratio>=0.97&&r.ratio<=1.04);
+  }).filter(r=>r.ratio>=0.97&&r.ratio<=1.03); // symmetric ±3% DC-fit band, matching the ±3% actualILR tolerance gate elsewhere
   if(!rows.length)return null;
   rows.sort((a,b)=>Math.abs(a.ratio-1)-Math.abs(b.ratio-1)||a.actualDCW-b.actualDCW);
   return rows[0];
@@ -4934,7 +4935,21 @@ function buildHourlyPoaProfileForMonth(latDeg,monthIndex,tiltDeg,dailyGHI,dailyD
   // DNI/GHI decompositions while retaining a transparent 24-hour screening profile.
   return steps;
 }
-function calculateCandidateEnergy(cfg,monthlyPOA,monthlyTempMean,geo,assump,monthlyDNI,monthlyGHI){
+/* Builds the 12 monthly hourly-POA profiles once for a given lat/tilt/resource set.
+   These profiles depend only on latitude, month, tilt and the site's GHI/DHI/DNI —
+   never on the module, inverter, string length or ILR being evaluated — so a grid
+   search over those parameters (optimizePlant, runJointResearchSweep) can compute
+   this once and reuse it for every candidate instead of rebuilding it per candidate. */
+function buildMonthlyProfileCache(latDeg,tiltDeg,monthlyGHI,monthlyDHI,monthlyDNI){
+  const cache=new Array(12).fill(null);
+  for(let i=0;i<12;i++){
+    const dGHI=monthlyGHI?.[i]; if(dGHI==null)continue;
+    const dDHI=monthlyDHI?.[i]; const dDNI=monthlyDNI?.[i];
+    cache[i]=buildHourlyPoaProfileForMonth(latDeg||0,i,tiltDeg,dGHI,dDHI,dDNI);
+  }
+  return cache;
+}
+function calculateCandidateEnergy(cfg,monthlyPOA,monthlyTempMean,geo,assump,monthlyDNI,monthlyGHI,profileCache){
   const module=cfg.module,monthlyNet=[],monthlyGross=[],monthlyClipping=[],monthlyTempDiag=[];
   const monthlyTempAdjusted=[],monthlyAfterDCLoss=[],monthlyAfterInverter=[],monthlyInverterLoss=[],monthlyAfterACLoss=[];
   const tilt=Number.isFinite(assump.tilt)?assump.tilt:(window.plantState?.tiltOpt?.best?.tilt||20);
@@ -4949,8 +4964,14 @@ function calculateCandidateEnergy(cfg,monthlyPOA,monthlyTempMean,geo,assump,mont
       monthlyTempAdjusted.push(null);monthlyAfterDCLoss.push(null);monthlyAfterInverter.push(null);monthlyInverterLoss.push(null);monthlyAfterACLoss.push(null);
       continue;
     }
-    const dGHI=monthlyGHI?.[i]; const dDHI=window.siteData?.monthlyDHI?.[i]; const dDNI=monthlyDNI?.[i];
-    const profile=buildHourlyPoaProfileForMonth(window.siteData?.lat||0,i,tilt,dGHI,dDHI,dDNI);
+    /* Reuse a precomputed monthly profile when the caller supplies one (grid-search
+       callers do, via buildMonthlyProfileCache); otherwise build it as before so any
+       single-candidate caller keeps working unchanged. */
+    let profile=profileCache?profileCache[i]:null;
+    if(!profile){
+      const dGHI=monthlyGHI?.[i]; const dDHI=window.siteData?.monthlyDHI?.[i]; const dDNI=monthlyDNI?.[i];
+      profile=buildHourlyPoaProfileForMonth(window.siteData?.lat||0,i,tilt,dGHI,dDHI,dDNI);
+    }
     const days=DAYS_IN_MONTH[i];
     let stcDC=0,tempDC=0,afterDC=0,afterInv=0,invLoss=0,clipEnergy=0,net=0;
     let tempIdeal=0,tempModeled=0;
@@ -5032,8 +5053,15 @@ function buildCapexBreakdown(totalCapexCr){
   return CAPEX_CATEGORIES.map(c=>({name:c.name,pct:c.weight/totalW*100,cr:totalCapexCr*c.weight/totalW}));
 }
 
-function buildCashFlowTable(degradationSeries,tariff,opexLakhY1,opexEscalationPct,discountRatePct){
-  const rows=[];let cumulative=0;
+function buildCashFlowTable(degradationSeries,tariff,opexLakhY1,opexEscalationPct,discountRatePct,capexCr){
+  const rows=[];
+  // Cumulative cash position must start from the initial CAPEX outflow (at year 0), not zero,
+  // otherwise the running total never goes negative and can't show when the project actually
+  // pays back — it would be inconsistent with the Simple/Discounted payback KPIs, which do
+  // net the cash flows against CAPEX correctly.
+  const capexLakh=Number(capexCr)*100;
+  const hasCapex=Number.isFinite(capexLakh);
+  let cumulative=hasCapex?-capexLakh:0,discCumulative=hasCapex?-capexLakh:0;
   degradationSeries.forEach(d=>{
     const genMWh=d.gen/1000;
     const revenueLakh=d.gen*tariff/1e5;
@@ -5041,7 +5069,9 @@ function buildCashFlowTable(degradationSeries,tariff,opexLakhY1,opexEscalationPc
     const netLakh=revenueLakh-opexLakh;
     cumulative+=netLakh;
     const discFactor=Math.pow(1+discountRatePct/100,d.year);
-    rows.push({year:d.year,genMWh,revenueLakh,opexLakh,netLakh,cumulative,discNet:netLakh/discFactor});
+    const discNet=netLakh/discFactor;
+    discCumulative+=discNet;
+    rows.push({year:d.year,genMWh,revenueLakh,opexLakh,netLakh,cumulative,discNet,discCumulative});
   });
   return rows;
 }
@@ -5237,12 +5267,18 @@ function optimizePlant(capacityMW,sd,geo,tiltOpt,assump){
   const invKeys=['sungrow250hx','sungrow285hx','sungrow320hx','sungrow350hx','sungrow3300','sungrow4400'];
   const ilrs=[1.10,1.15,1.20,1.25,1.30,1.35,1.40,1.45];
   const results=[];
+  /* Precompute the 12 monthly hourly-POA profiles ONCE for this optimization run.
+     They only depend on lat/tilt/site resource data, which are fixed for the whole
+     module × inverter × ILR × string-length grid search below, so building them
+     inside the loop (as before) recomputed identical data thousands of times. */
+  const optimizeTilt=Number.isFinite(assump.tilt)?assump.tilt:(tiltOpt?.best?.tilt||20);
+  const profileCache=buildMonthlyProfileCache(sd.lat,optimizeTilt,sd.monthlyGHI,sd.monthlyDHI,sd.monthlyDNI);
   for(const mk of moduleKeys)for(const ik of invKeys)for(const ilr of ilrs){
     const m=MODULE_PRESETS[mk],inv=INVERTER_PRESETS[ik];
     for(const ns of candidateStringRange()){
       const cfg=candidateDesign(capacityMW,ilr,m,inv,ns,sd.monthlyTempMin,sd.monthlyTempMax,sd.monthlyWind,assump);
       if(!cfg)continue;
-      const gen=calculateCandidateEnergy(cfg,tiltOpt.best.monthlyPOAvals,sd.monthlyTempMean,geo,assump,sd.monthlyDNI,sd.monthlyGHI);
+      const gen=calculateCandidateEnergy(cfg,tiltOpt.best.monthlyPOAvals,sd.monthlyTempMean,geo,assump,sd.monthlyDNI,sd.monthlyGHI,profileCache);
       const cap=candidateCapex(cfg,capacityMW,assump.technology==='tracker',assump,pricingMode);
       const sy=gen.annualNet/(cfg.actualDCW/1000);
       const priced=cap.totalCr!=null;
@@ -5367,12 +5403,17 @@ function runJointResearchSweep(){
   const comp=validateSelectedComponents(); if(!comp.ok)return {ok:false,message:comp.message};
   const ilrs=researchIlrValues(), nsVals=researchStringValues(), sd=ctx.sd, assump=plantAssumptions;
   const module=getSelectedModule(), inverter=getSelectedInverter(), rows=[], matrix={};
+  /* Same fix as optimizePlant(): build the monthly hourly-POA profiles once for this
+     sweep's lat/tilt/site resource data, rather than rebuilding them for every one
+     of the string-length × ILR combinations checked below. */
+  const researchTilt=Number.isFinite(assump.tilt)?assump.tilt:(ctx.tiltOpt?.best?.tilt||20);
+  const researchProfileCache=buildMonthlyProfileCache(sd.lat,researchTilt,sd.monthlyGHI,sd.monthlyDHI,sd.monthlyDNI);
   for(const ns of nsVals){matrix[ns]={}; for(const ilr of ilrs){
     const cfg=candidateDesign(plantCapacityMW,ilr,module,inverter,ns,sd.monthlyTempMin,sd.monthlyTempMax,sd.monthlyWind,assump);
     if(!cfg){matrix[ns][ilr]=null;continue;}
     const feasible=cfg.checks.every(c=>c.pass)&&cfg.acFitPass;
     if(!feasible){matrix[ns][ilr]={status:'infeasible',cfg};continue;}
-    const gen=calculateCandidateEnergy(cfg,ctx.tiltOpt.best.monthlyPOAvals,sd.monthlyTempMean,ctx.geo,assump,sd.monthlyDNI,sd.monthlyGHI);
+    const gen=calculateCandidateEnergy(cfg,ctx.tiltOpt.best.monthlyPOAvals,sd.monthlyTempMean,ctx.geo,assump,sd.monthlyDNI,sd.monthlyGHI,researchProfileCache);
     const cap=candidateCapex(cfg,plantCapacityMW,assump.technology==='tracker',assump,document.getElementById('pricingMode')?.value||assump.pricingMode||'actual');
     const fin=researchCandidateFinance(cfg,gen,cap,assump);
     const r={ns,ilr,actualILR:cfg.actualILR,cfg,gen,cap,...fin,clip:gen.clip,annualNet:gen.annualNet,status:'feasible',score:null};
@@ -5651,7 +5692,7 @@ async function runPlantDesign(){
     const dcKWp=plantCapacityMW*1000*ilrVal;
     const gen=runGenerationModel(dcKWp,tiltOpt.best.monthlyPOAvals,sd.monthlyTempMean,geo,ilrVal,assump);
     const annualNet=annualSum(gen.monthlyNet);
-    const baseBopCr=Math.max(0,assump.capexPerMW*plantCapacityMW-(plantCapacityMW*1.30*1000*assump.referenceModuleRsPerWp/1e7)-(plantCapacityMW*assump.referenceInverterRsPerKW/1e7));
+    const baseBopCr=Math.max(0,assump.capexPerMW*plantCapacityMW-(plantCapacityMW*1.30*1000*1000*assump.referenceModuleRsPerWp/1e7)-(plantCapacityMW*1000*assump.referenceInverterRsPerKW/1e7));
     const scenarioModuleCr=dcKWp*1000*assump.referenceModuleRsPerWp/1e7;
     const scenarioInverterCr=plantCapacityMW*1000*assump.referenceInverterRsPerKW/1e7;
     const capexCr=Math.max(0,baseBopCr+scenarioModuleCr+scenarioInverterCr+(assump.technology==='tracker'?assump.trackerCapexPremium*plantCapacityMW:0));
@@ -5669,7 +5710,7 @@ async function runPlantDesign(){
   const annualNetKWh=annualSum(genModel.monthlyNet);
   const dailyAvgKWh=annualNetKWh/365;
   const specificYield=annualNetKWh/(cfg.dcW/1000);
-  const referenceYield=weightedAnnualMean(tiltOpt.best.monthlyPOAvals);
+  const referenceYield=weightedAnnualMean(tiltOpt.best.monthlyPOAvals)*365; // Yr = annual POA (kWh/m^2/yr) / 1 kW/m^2 reference irradiance; weightedAnnualMean() returns a kWh/m^2/day average, so scale to annual
   const prPct=referenceYield>0?(specificYield/referenceYield*100):null;
   const cfPct=cfg.installedInverterACkW>0?annualNetKWh/(cfg.installedInverterACkW*8760)*100:null;
   document.getElementById('genCards').innerHTML=`
@@ -5703,9 +5744,15 @@ async function runPlantDesign(){
 
   // Step 12 — equipment schedule
   const pricingMode=assump.pricingMode||'actual';
-  const capexData=candidateCapex(cfg,plantCapacityMW,assump.technology==='tracker',assump,pricingMode);
-  const capexBreakdown=buildDetailedCapexBreakdown(cfg,capexData,plantCapacityMW,assump.technology==='tracker',assump);
-  const equipment=buildEquipmentSchedule(cfg,capexBreakdown,plantCapacityMW,assump.technology==='tracker');
+  // Cost the plant at its actual as-built AC capacity, not the nominal requested capacity:
+  // integer inverter/string sizing can install up to 15% more AC than requested (see the
+  // 98%-115% fit band in chooseInverterCount()), and revenue/generation already reflect that
+  // actual size. Costing CAPEX/OPEX on the smaller nominal target understates them relative
+  // to the true as-built plant and makes payback look shorter than it really is.
+  const actualCapacityMW=cfg.installedInverterACkW/1000;
+  const capexData=candidateCapex(cfg,actualCapacityMW,assump.technology==='tracker',assump,pricingMode);
+  const capexBreakdown=buildDetailedCapexBreakdown(cfg,capexData,actualCapacityMW,assump.technology==='tracker',assump);
+  const equipment=buildEquipmentSchedule(cfg,capexBreakdown,actualCapacityMW,assump.technology==='tracker');
   document.querySelector('#equipTable tbody').innerHTML=equipment.map(e=>`<tr><td>${e.name}</td><td>${e.qty}</td><td>${e.cap}</td><td>${e.unitCost==null?'—':'₹'+Number(e.unitCost).toLocaleString('en-IN')}</td><td>${e.cr==null?'—':'₹'+Number(e.cr).toFixed(2)+' cr'}</td><td>${e.source}</td><td>${e.conf}</td></tr>`).join('');
 
   // Step 13 — land
@@ -5715,14 +5762,22 @@ async function runPlantDesign(){
 
   // Step 14 — CAPEX
   const capexTotalCr=capexData.totalCr;
+  const capexPerMWActual=capexTotalCr!=null&&actualCapacityMW>0?capexTotalCr/actualCapacityMW:null;
+  // Sanity guard: real Indian utility-scale turnkey EPC runs ~₹3.5-4.5 cr/MW (2026 benchmarks).
+  // A figure far outside a generous ₹1.5-8 cr/MW band almost always means a price field was
+  // entered in the wrong unit (e.g. ₹/Wp typed into the ₹/module field, collapsing module/
+  // inverter cost to near-zero so only the BOP estimate remains) rather than a real project cost.
+  const capexImplausible=capexPerMWActual!=null&&(capexPerMWActual<1.5||capexPerMWActual>8);
   document.getElementById('capexCards').innerHTML=`
     <div class="card solar"><div class="k">Total CAPEX</div><div class="v">${capexTotalCr==null?'—':capexTotalCr.toFixed(2)}</div><div class="u">₹ crore</div></div>
-    <div class="card dni"><div class="k">Per MW AC</div><div class="v">${capexTotalCr==null?'—':(capexTotalCr/plantCapacityMW).toFixed(2)}</div><div class="u">₹ cr/MW</div></div>
-    <div class="card dhi"><div class="k">Price status</div><div class="v">${capexTotalCr==null?'INCOMPLETE':'SOURCED'}</div><div class="u">${capexTotalCr==null?'Actual equipment price required':'Component prices applied'}</div></div>`;
+    <div class="card dni"><div class="k">Per MW AC</div><div class="v">${capexPerMWActual==null?'—':capexPerMWActual.toFixed(2)}</div><div class="u">₹ cr/MW</div></div>
+    <div class="card dhi"><div class="k">Price status</div><div class="v">${capexTotalCr==null?'INCOMPLETE':(capexImplausible?'CHECK PRICES':'SOURCED')}</div><div class="u">${capexTotalCr==null?'Actual equipment price required':(capexImplausible?'₹/MW outside realistic range':'Component prices applied')}</div></div>`;
   document.querySelector('#capexTable tbody').innerHTML=capexBreakdown.map(c=>`<tr><td>${c.name}</td><td>${c.pct==null?'—':c.pct.toFixed(1)+'%'}</td><td>${c.cr==null?'—':'₹'+c.cr.toFixed(2)+' cr'}</td><td>${c.source}</td></tr>`).join('');
-  document.getElementById('pricingWarning').style.display=capexTotalCr==null?'block':'none';
+  document.getElementById('pricingWarning').style.display=(capexTotalCr==null||capexImplausible)?'block':'none';
   if(capexTotalCr==null)document.getElementById('pricingWarning').textContent='Financial model paused: a sourced/user module price and a sourced/user inverter unit price are required in Actual mode. Switch to Benchmark mode or enter an inverter quotation; benchmark pricing is an engineering estimate, not a supplier quotation.';
+  else if(capexImplausible)document.getElementById('pricingWarning').textContent=`CAPEX works out to ₹${capexPerMWActual.toFixed(2)} cr/MW, well outside the realistic ₹3.5–4.5 cr/MW turnkey EPC range for Indian utility-scale solar. This almost always means the module price (₹/module) or inverter price (₹/unit) field was entered using the wrong unit — e.g. a ₹/Wp or ₹/kW figure typed into a total-per-unit field. Check the price-source notes under each equipment selection above, or switch to Benchmark pricing to isolate the issue.`;
   addEngRecord('CAPEX status',capexTotalCr==null?'Incomplete — equipment price required':capexTotalCr.toFixed(2),'₹ crore','Component-priced CAPEX + estimated remaining BOS/EPC benchmark','Calculated','Equipment pricing completeness');
+
 
   // Step 15 & 16 — tariff + revenue
   const tariff=Number(document.getElementById('tariffInput').value)||assump.tariff;
@@ -5733,8 +5788,8 @@ async function runPlantDesign(){
     <div class="card dni"><div class="k">Selling price</div><div class="v">${tariff.toFixed(2)}</div><div class="u">₹/kWh</div></div>
     <div class="card dhi"><div class="k">Annual gross revenue</div><div class="v">${annualRevenueCr.toFixed(2)}</div><div class="u">₹ crore/year</div></div>`;
 
-  // Step 17 — OPEX
-  const opexTotalLakh=assump.opexPerMW*plantCapacityMW;
+  // Step 17 — OPEX (costed on the actual as-built AC capacity, consistent with CAPEX above)
+  const opexTotalLakh=assump.opexPerMW*actualCapacityMW;
   const opexBreakdown=buildOpexBreakdown(opexTotalLakh);
   document.getElementById('opexCards').innerHTML=`
     <div class="card solar"><div class="k">Annual OPEX</div><div class="v">${(opexTotalLakh/100).toFixed(2)}</div><div class="u">₹ crore/year</div></div>
@@ -5748,7 +5803,7 @@ async function runPlantDesign(){
 
   let cashRows=[],simplePayback=null,discPayback=null,npv=null,irr=null,lcoe=null;
   if(capexTotalCr!=null){
-    cashRows=buildCashFlowTable(degSeriesMain,tariff,opexTotalLakh,assump.opexEscalation,assump.discountRate);
+    cashRows=buildCashFlowTable(degSeriesMain,tariff,opexTotalLakh,assump.opexEscalation,assump.discountRate,capexTotalCr);
     simplePayback=findPayback(cashRows,capexTotalCr);
     discPayback=findDiscountedPayback(cashRows,capexTotalCr);
     npv=computeNPV(cashRows,capexTotalCr);
@@ -5761,8 +5816,9 @@ async function runPlantDesign(){
     <div class="card solar"><div class="k">Simple payback</div><div class="v">${simplePayback!=null?simplePayback.toFixed(1):'—'}</div><div class="u">${simplePayback!=null?'years':'Price required'}</div></div>
     <div class="card dni"><div class="k">Discounted payback</div><div class="v">${discPayback!=null?discPayback.toFixed(1):'—'}</div><div class="u">${discPayback!=null?'years':'Price required'}</div></div>
     <div class="card dhi"><div class="k">NPV</div><div class="v">${npv!=null?npv.toFixed(2):'—'}</div><div class="u">₹ crore</div></div>
-    <div class="card wind"><div class="k">IRR</div><div class="v">${irrDisplay}</div><div class="u">${irrUnit}</div></div>`;
-  document.querySelector('#cashflowTable tbody').innerHTML=cashRows.filter(r=>[1,2,3,4,5,10,15,20,25,30].includes(r.year)||r.year===assump.projectLife).map(r=>`<tr><td>${r.year}</td><td>${r.genMWh.toFixed(0)}</td><td>${r.revenueLakh.toFixed(1)}</td><td>${r.opexLakh.toFixed(1)}</td><td>${r.netLakh.toFixed(1)}</td><td>${r.cumulative.toFixed(1)}</td></tr>`).join('');
+    <div class="card wind"><div class="k">IRR</div><div class="v">${irrDisplay}</div><div class="u">${irrUnit}</div></div>
+    ${capexImplausible?`<div class="check-warn" style="grid-column:1/-1;padding:8px 0;font-size:.9em">⚠ Payback above is calculated correctly from CAPEX, but that CAPEX (₹${capexPerMWActual.toFixed(2)} cr/MW) itself looks wrong — see the CAPEX warning below. Fix the equipment price units first; this payback number will change once it's corrected.</div>`:''}`;
+  document.querySelector('#cashflowTable tbody').innerHTML=cashRows.filter(r=>[1,2,3,4,5,10,15,20,25,30].includes(r.year)||r.year===assump.projectLife).map(r=>`<tr><td>${r.year}</td><td>${r.genMWh.toFixed(0)}</td><td>${r.revenueLakh.toFixed(1)}</td><td>${r.opexLakh.toFixed(1)}</td><td>${r.netLakh.toFixed(1)}</td><td>${r.cumulative.toFixed(1)}</td><td>${r.discCumulative.toFixed(1)}</td></tr>`).join('');
   document.getElementById('lcoeResult').innerHTML=`<div class="exec-grid"><div><span>LCOE</span><b>${lcoe!=null?'₹'+lcoe.toFixed(3)+'/kWh':'—'}</b></div><div><span>vs. selling price</span><b class="${lcoe!=null?(lcoe<tariff?'check-ok':'check-warn'):''}">${lcoe!=null?'₹'+tariff.toFixed(2)+'/kWh':'Price required'}</b></div><div><span>Discount rate used</span><b>${assump.discountRate}%</b></div><div><span>Project life</span><b>${assump.projectLife} years</b></div></div>`;
   addEngRecord('LCOE',lcoe!=null?lcoe.toFixed(3):'PRICE REQUIRED','₹/kWh','Discounted lifetime cost ÷ discounted lifetime generation','Calculated','Requires complete equipment pricing');
   addEngRecord('Simple payback',simplePayback!=null?simplePayback.toFixed(1):'PRICE REQUIRED','years','Cumulative undiscounted cash flow crosses zero','Calculated','Requires complete equipment pricing');
@@ -5900,12 +5956,12 @@ function updatePricingUI(){
   const inverterFocused=document.activeElement===ii;
   if(ii && !inverterFocused)ii.value=ip!=null?String(ip):'';
   if(ms)ms.innerHTML=mp!=null
-    ? `${Number.isFinite(manualMp)?'Manual override: ':'Current price: '}<b>₹${Number(mp).toLocaleString('en-IN')}</b>/module · ${Number.isFinite(manualMp)?'user-entered procurement price':(mpRec?.basis||m.priceBasis||m.source||'Source not specified')}${mpRec?.date?` · ${mpRec.date}`:''}`
+    ? `${Number.isFinite(manualMp)?'Manual override: ':'Current price: '}<b>₹${Number(mp).toLocaleString('en-IN')}</b>/module · ${Number.isFinite(manualMp)?'user-entered procurement price':(mpRec?.basis||m.priceBasis||m.source||'Source not specified')}${mpRec?.date?` · ${mpRec.date}`:''}${(()=>{const perWp=m?.Wp>0?mp/m.Wp:null;return perWp!=null?` · ≈₹${perWp.toFixed(1)}/Wp`+((perWp<6||perWp>35)?` <span class="check-warn">— this looks like it may have been entered as ₹/Wp rather than ₹/module (whole panel); a ${m.Wp} Wp module is typically ₹${(m.Wp*6).toLocaleString('en-IN')}–₹${(m.Wp*35).toLocaleString('en-IN')}). Re-check the unit.</span>`:''):'';})()}`
     : `<span class="check-warn">Actual price required.</span> ${m.priceBasis||'Enter supplier/manufacturer quotation.'}`;
   if(is){
     const sourceRecord=!Number.isFinite(manualIp)?findEquipmentPriceRecord(v,'inverter'):null;
     is.innerHTML=ip!=null
-      ? `${Number.isFinite(manualIp)?'Manual override: ':'Current price: '}<b>₹${Number(ip).toLocaleString('en-IN')}</b>/unit · ${Number.isFinite(manualIp)?'user-entered procurement price':(ipRec?.basis||sourceRecord?.basis||v.priceBasis||v.source||'Source not specified')}${sourceRecord?.date?` · ${sourceRecord.date}`:''}`
+      ? `${Number.isFinite(manualIp)?'Manual override: ':'Current price: '}<b>₹${Number(ip).toLocaleString('en-IN')}</b>/unit · ${Number.isFinite(manualIp)?'user-entered procurement price':(ipRec?.basis||sourceRecord?.basis||v.priceBasis||v.source||'Source not specified')}${sourceRecord?.date?` · ${sourceRecord.date}`:''}${(()=>{const perKW=v?.acKW>0?ip/v.acKW:null;return perKW!=null?` · ≈₹${perKW.toFixed(0)}/kW`+((perKW<1000||perKW>10000)?` <span class="check-warn">— this looks like it may have been entered as ₹/kW rather than ₹/unit (whole inverter); a ${v.acKW} kW inverter is typically ₹${(v.acKW*1000).toLocaleString('en-IN')}–₹${(v.acKW*10000).toLocaleString('en-IN')}). Re-check the unit.</span>`:''):'';})()}`
       : `<span class="check-warn">No numeric inverter unit price is available.</span> Enter a quotation, or switch to Benchmark mode.`;
   }
   if(mbi)mbi.textContent=benchmark!=null?`Benchmark: ₹${Number(benchmark).toLocaleString('en-IN')}/unit (₹${Number(plantAssumptions.referenceInverterRsPerKW||0).toLocaleString('en-IN')}/kW × ${Number(v?.acKW||0).toLocaleString('en-IN')} kW)`:'Benchmark unavailable';
